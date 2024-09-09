@@ -1,13 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <winhttp.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <wincrypt.h>
 #include <ctype.h>
+#include "cJSON.h" //for JSON parsing
 
 #define MD5_DIGEST_LENGTH 16
+#define SHA256_DIGEST_LENGTH 32
+#define MIN_STRING_LENGTH 4  // minimum meaningful string length
 
+#pragma comment(lib, "winhttp.lib")
 
 void printError(const char* msg) {
 	fprintf(stderr, "Error: %s\n", msg);
@@ -28,7 +33,7 @@ void calculateMD5(FILE* file, unsigned char* md5Digest) {
 		printError("CryptCreateHash failed.");
 	}
 
-	while ((bytesRead = fread(buffer, 1, 1024, file)) != 0) {
+	while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) != 0) {
 		if (!CryptHashData(hHash, buffer, bytesRead, 0)) {
 			printError("CryptHashData failed.");
 		}
@@ -36,6 +41,36 @@ void calculateMD5(FILE* file, unsigned char* md5Digest) {
 
 	DWORD md5Length = MD5_DIGEST_LENGTH;
 	if (!CryptGetHashParam(hHash, HP_HASHVAL, md5Digest, &md5Length, 0)) {
+		printError("CryptGetHashParam failed.");
+	}
+
+	CryptDestroyHash(hHash);
+	CryptReleaseContext(hProv, 0);
+
+}
+
+void calculateSHA256(FILE* file, unsigned char* sha256Digest) {
+	HCRYPTPROV hProv = 0;
+	HCRYPTPROV hHash = 0;
+	BYTE buffer[1024];
+	DWORD bytesRead = 0;
+
+	if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+		printError("CryptAcquireContext failed.");
+	}
+
+	if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+		printError("CryptCreateHash failed.");
+	}
+
+	while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+		if (!CryptHashData(hHash, buffer, bytesRead, 0)) {
+			printError("CryptHashData failed.");
+		}
+	}
+
+	DWORD sha256Length = SHA256_DIGEST_LENGTH;
+	if (!CryptGetHashParam(hHash, HP_HASHVAL, sha256Digest, &sha256Length, 0)) {
 		printError("CryptGetHashParam failed.");
 	}
 
@@ -55,6 +90,10 @@ void printFileInformation(const char* fileName, FILE* file, IMAGE_DOS_HEADER* do
 	fseek(file, 0, SEEK_SET);
 	unsigned char md5Digest[MD5_DIGEST_LENGTH];
 	calculateMD5(file, md5Digest);
+
+	fseek(file, 0, SEEK_SET);
+	unsigned char sha256Digest[SHA256_DIGEST_LENGTH];
+	calculateSHA256(file, sha256Digest);
 
 	printf("----FILE INFORMATION----\n");
 	printf("File name: %s\n", fileName);
@@ -90,6 +129,12 @@ void printFileInformation(const char* fileName, FILE* file, IMAGE_DOS_HEADER* do
 	}
 	printf("\n");
 
+	printf("SHA256 Hash: ");
+	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+		printf("%02x", sha256Digest[i]);
+	}
+	printf("\n");
+
 	printf("File type: ");
 	switch (optionalHeader->Subsystem) {
 	case IMAGE_SUBSYSTEM_WINDOWS_GUI: printf("Windows GUI\n"); break;
@@ -121,27 +166,6 @@ void printDosHeader(IMAGE_DOS_HEADER* dosHeader) {
 	printf("Second reserved: 0x%x\n", dosHeader->e_res2[10]);
 	printf("Address of NT headers: 0x%x\n\n", dosHeader->e_lfanew);
 }
-
-//void printDosStub(FILE* file, LONG stubSize) {
-//	BYTE* stubData = (BYTE*)malloc(stubSize);
-//	if (stubData == NULL) {
-//		printf("Memory allocation error.\n");
-//		return;
-//	}
-//
-//	fseek(file, sizeof(IMAGE_DOS_HEADER), SEEK_SET);
-//	fread(stubData, 1, stubSize, file);
-//
-//	printf("----DOS STUB----\n");
-//	for (LONG i = 0; i < stubSize; i++) {
-//		printf("%02X", stubData[i]);
-//		if ((i + 1) % 16 == 0) {
-//			printf("\n");
-//		}
-//	}
-//	printf("\n\n");
-//	free(stubData);
-//}
 
 void printFileHeader(IMAGE_FILE_HEADER* fileHeader) {
 	printf("----IMAGE_FILE_HEADER----\n");
@@ -236,7 +260,7 @@ void printImportTable(FILE* file, IMAGE_DATA_DIRECTORY* importDir, IMAGE_OPTIONA
 		printf("No import table found.\n");
 		return;
 	}
-	//To read the data from the file, RVA must be converted to a file offset 
+	// RVA to file offset translation
 	DWORD importTableOffset = RvaToOffset(importDir->VirtualAddress, sectionHeaders, numberOfSections);
 	fseek(file, importTableOffset, SEEK_SET);
 
@@ -249,33 +273,65 @@ void printImportTable(FILE* file, IMAGE_DATA_DIRECTORY* importDir, IMAGE_OPTIONA
 			break;
 		}
 
-		DWORD nameRVA = importDesc.Name;  // Get the RVA of the DLL name
+		// get DLL name
+		DWORD nameRVA = importDesc.Name;
 		DWORD nameOffset = RvaToOffset(nameRVA, sectionHeaders, numberOfSections);
-
-		// Save the current file position before seeking to the DLL name
 		DWORD currentPos = ftell(file);
 		fseek(file, nameOffset, SEEK_SET);
 
-		char dllName[256] = { 0 }; //clear dllName array 
+		char dllName[256] = { 0 };
 		fread(dllName, sizeof(char), 256, file);
 		printf("DLL Name: %s\n", dllName);
 
-		// Restore the file position to continue reading the import descriptor
-		fseek(file, currentPos, SEEK_SET);
+		// get OriginalFirstThunk or FirstThunk value
+		DWORD thunkRVA = importDesc.OriginalFirstThunk ? importDesc.OriginalFirstThunk : importDesc.FirstThunk;
+		DWORD thunkOffset = RvaToOffset(thunkRVA, sectionHeaders, numberOfSections);
+		fseek(file, thunkOffset, SEEK_SET);
+
+		IMAGE_THUNK_DATA thunkData;
+
+		while (1) {
+			fread(&thunkData, sizeof(IMAGE_THUNK_DATA), 1, file);
+			if (thunkData.u1.Function == 0) {
+				break;
+			}
+
+			// if the highest bit is set, it's an ordinal; otherwise, it's a name.
+			if (thunkData.u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
+				printf("  Ordinal: %u\n", thunkData.u1.Ordinal & 0xFFFF);
+			}
+			else {
+				// fet functions names
+				DWORD functionNameRVA = thunkData.u1.AddressOfData;
+				DWORD functionNameOffset = RvaToOffset(functionNameRVA + 2, sectionHeaders, numberOfSections);
+				currentPos = ftell(file);
+				fseek(file, functionNameOffset, SEEK_SET);
+
+				char functionName[256] = { 0 };
+				fread(functionName, sizeof(char), 256, file);
+				printf("  Function: %s\n", functionName);
+
+				fseek(file, currentPos, SEEK_SET);
+			}
+		}
+		// next IMAGE_IMPORT_DESCRIPTOR
+		importTableOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+		fseek(file, importTableOffset, SEEK_SET);
 	}
 }
-
 
 //function to translate RVA to file offset
 DWORD RvaToOffset(DWORD rva, IMAGE_SECTION_HEADER* sectionHeaders, int numberOfSections) {
 	for (int i = 0; i < numberOfSections; i++) {
+		// RVA is comparing with SizeOfRawData 
 		if (rva >= sectionHeaders[i].VirtualAddress &&
-			rva < sectionHeaders[i].VirtualAddress + sectionHeaders[i].Misc.VirtualSize) //converts the RVA to file offset
+			rva < sectionHeaders[i].VirtualAddress + sectionHeaders[i].SizeOfRawData)
 		{
 			return rva - sectionHeaders[i].VirtualAddress + sectionHeaders[i].PointerToRawData;
 		}
 	}
-	return 0;  // If RVA dosen't match with any offset, return 0
+	printf("Error: RVA 0x%X does not match any section.\n", rva);
+	return 0;
 }
 
 void hexDump(const char* fileName) {
@@ -334,6 +390,8 @@ void printStrings(const char* fileName) {
 	unsigned char buffer[32];
 	size_t bytesRead;
 	int i, c;
+	char tempString[256];  // Temporary buffer to store potential strings
+	int tempIndex = 0;     // Index for tempString
 
 	// Open file
 	errno_t err = fopen_s(&fp, fileName, "rb");
@@ -346,22 +404,255 @@ void printStrings(const char* fileName) {
 	while ((bytesRead = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
 		for (i = 0; i < bytesRead; i++) {
 			c = buffer[i];
-			// Letter check (ASCII)
-			if (c != '\0' && (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
-				printf("%c", c);
+			// Check if the character is a printable ASCII letter
+			if (isprint(c)) {
+				// Add to temporary string buffer
+				tempString[tempIndex++] = c;
+
+				// Prevent buffer overflow
+				if (tempIndex >= sizeof(tempString) - 1) {
+					tempString[tempIndex] = '\0';  // Null-terminate
+					if (strlen(tempString) >= MIN_STRING_LENGTH) {
+						printf("%s\n", tempString);
+					}
+					tempIndex = 0;
+				}
+			}
+			else {
+				// If non-printable character encountered, check the length of the tempString
+				if (tempIndex >= MIN_STRING_LENGTH) {
+					tempString[tempIndex] = '\0';  // Null-terminate
+					printf("%s\n", tempString);
+				}
+				tempIndex = 0;  // Reset tempString
 			}
 		}
+	}
+
+	// If there's any leftover string after the loop
+	if (tempIndex >= MIN_STRING_LENGTH) {
+		tempString[tempIndex] = '\0';
+		printf("%s\n", tempString);
 	}
 
 	fclose(fp);
 }
 
+void parseJsonResponse(const char* response) {
+	// JSON parsing for JSON response
+	cJSON* json = cJSON_Parse(response);
+	if (json == NULL) {
+		printf("Error parsing JSON response.\n");
+		return;
+	}
+
+	// Finding scans in Virustotal API response
+	cJSON* scans = cJSON_GetObjectItemCaseSensitive(json, "scans");
+	if (scans == NULL) {
+		printf("No scans data found in the response.\n");
+		cJSON_Delete(json);
+		return;
+	}
+
+	printf("Antivirus detections:\n");
+	printf("\n");
+
+	// iterate over each antivirus detection within scans
+	cJSON* scanItem = NULL;
+	cJSON_ArrayForEach(scanItem, scans) {
+		// Antivirus name
+		const char* antivirusName = scanItem->string;
+
+		// AV detection response
+		cJSON* detected = cJSON_GetObjectItemCaseSensitive(scanItem, "detected");
+		cJSON* result = cJSON_GetObjectItemCaseSensitive(scanItem, "result");
+
+		// if detected
+		if (cJSON_IsBool(detected) && cJSON_IsTrue(detected)) {
+			if (result != NULL && result->valuestring != NULL) {
+				printf("Antivirus: %20.40s,  Result: %40.40s\n", antivirusName, result->valuestring);
+			}
+			else {
+				printf("Antivirus: %s,  Result: (unknown)", antivirusName);
+			}
+		}
+	}
+	printf("\n");
+	printf("Antivirus detections (Undetected):\n");
+	printf("\n");
+
+	cJSON_ArrayForEach(scanItem, scans) {
+		const char* antivirusName = scanItem->string;
+
+		cJSON* detected = cJSON_GetObjectItemCaseSensitive(scanItem, "detected");
+
+		// if not detected
+		if (cJSON_IsBool(detected) && cJSON_IsFalse(detected)) {
+
+			printf("Antivirus: %20.40s,  Result: Clean\n", antivirusName);
+
+		}
+	}
+
+	// cleary memory
+	cJSON_Delete(json);
+}
+
+void queryVirusTotal(const char* apiKey, const char* hash) {
+	HINTERNET hSession = WinHttpOpen(L"VirusTotalHashQuery/1.0",
+		WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME,
+		WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hSession) {
+		printf("WinHttpOpen failed with error: %ld\n", GetLastError());
+		return;
+	}
+
+	HINTERNET hConnect = WinHttpConnect(hSession, L"www.virustotal.com",
+		INTERNET_DEFAULT_HTTPS_PORT, 0);
+	if (!hConnect) {
+		printf("WinHttpConnect failed with error: %ld\n", GetLastError());
+		WinHttpCloseHandle(hSession);
+		return;
+	}
+
+	wchar_t urlPath[512];
+	swprintf(urlPath, 512, L"/vtapi/v2/file/report?apikey=%hs&resource=%hs", apiKey, hash);
+
+	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL,
+		WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES,
+		WINHTTP_FLAG_SECURE);
+	if (!hRequest) {
+		printf("WinHttpOpenRequest failed with error: %ld\n", GetLastError());
+		WinHttpCloseHandle(hConnect);
+		WinHttpCloseHandle(hSession);
+		return;
+	}
+
+	if (!WinHttpSendRequest(hRequest,
+		WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+		WINHTTP_NO_REQUEST_DATA, 0,
+		0, 0)) {
+		printf("WinHttpSendRequest failed with error: %ld\n", GetLastError());
+		WinHttpCloseHandle(hRequest);
+		WinHttpCloseHandle(hConnect);
+		WinHttpCloseHandle(hSession);
+		return;
+	}
+
+	if (!WinHttpReceiveResponse(hRequest, NULL)) {
+		printf("WinHttpReceiveResponse failed with error: %ld\n", GetLastError());
+		WinHttpCloseHandle(hRequest);
+		WinHttpCloseHandle(hConnect);
+		WinHttpCloseHandle(hSession);
+		return;
+	}
+
+	DWORD dwSize = 0;
+	DWORD dwDownloaded = 0;
+	char* jsonResponse = NULL;  // Initialize to NULL
+	size_t jsonResponseSize = 0;  // Track the size of the buffer
+
+	do {
+		dwSize = 0;
+		if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) {
+			printf("WinHttpQueryDataAvailable failed with error: %ld\n", GetLastError());
+			break;
+		}
+
+		/*if (dwSize == 0) {
+			printf("No data available to read.\n");
+			break;
+		}*/
+
+		char* pszOutBuffer = (char*)malloc(dwSize + 1);
+		if (!pszOutBuffer) {
+			printf("Out of memory\n");
+			dwSize = 0;
+		}
+		else {
+			ZeroMemory(pszOutBuffer, dwSize + 1);
+			if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer, dwSize, &dwDownloaded)) {
+				printf("WinHttpReadData failed with error: %ld\n", GetLastError());
+			}
+			else {
+				// Print the size of data read
+				/*printf("Data read size: %lu\n", dwDownloaded);*/
+
+				// If jsonResponse is NULL, allocate initial buffer
+				if (jsonResponse == NULL) {
+					jsonResponse = (char*)malloc(dwSize + 1);
+					if (jsonResponse) {
+						jsonResponseSize = dwSize + 1;
+						strcpy_s(jsonResponse, jsonResponseSize, pszOutBuffer);
+					}
+				}
+				else {
+					// Reallocate buffer to accommodate new data
+					char* temp = (char*)realloc(jsonResponse, jsonResponseSize + dwSize);
+					if (temp) {
+						jsonResponse = temp;
+						jsonResponseSize += dwSize;
+						strcat_s(jsonResponse, jsonResponseSize, pszOutBuffer);
+					}
+				}
+			}
+			free(pszOutBuffer);
+		}
+	} while (dwSize > 0);
+
+	if (jsonResponse != NULL) {
+		// Print the final JSON response for debugging
+		/*printf("Final JSON Response: %s\n", jsonResponse);*/
+		parseJsonResponse(jsonResponse);  // pass the full accumulated response
+		free(jsonResponse);  // free the allocated memory
+	}
+	else {
+		printf("No response received from VirusTotal.\n");
+	}
+
+	WinHttpCloseHandle(hRequest);
+	WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hSession);
+}
+
+// Function to convert binary hash to a hexadecimal string
+void hashToHexString(unsigned char* hash, char* hexStr, size_t hexStrSize) {
+	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+		snprintf(hexStr + (i * 2), hexStrSize - (i * 2), "%02x", hash[i]);
+	}
+	hexStr[hexStrSize - 1] = '\0';  // Ensure null-termination
+}
+
 int main(int argc, char* argv[]) {
 	if (argc != 2) {
 		printError("Usage: parser.exe <path_to_pe_file>");
+		return 1;
 	}
 
-	FILE* file;
+	const char* apiKey = "cc0181eac3a5c2fc232a95deb529ebb78c74fe55e359fe41f0263e27892bfc1e";
+	const char* filePath = argv[1];
+
+	// Open the file to calculate the hash
+	FILE* file = fopen(filePath, "rb");
+	if (!file) {
+		printf("Failed to open file: %s\n", filePath);
+		return 1;
+	}
+
+	// Calculate the SHA256 hash
+	unsigned char sha256Digest[SHA256_DIGEST_LENGTH];
+	calculateSHA256(file, sha256Digest);
+
+	// Convert the hash to a hexadecimal string
+	char fileHash[SHA256_DIGEST_LENGTH * 2 + 1];
+	hashToHexString(sha256Digest, fileHash, sizeof(fileHash));
+
+	// Close the file
+	fclose(file);
+
+	//FILE* file;
 	errno_t err = fopen_s(&file, argv[1], "rb");
 	if (err != 0 || file == NULL) {
 		printError("Could not open the specified file.");
@@ -386,9 +677,6 @@ int main(int argc, char* argv[]) {
 		printError("Invalid NT Headers signature.");
 	}
 
-	/*LONG dosStubSize = dosHeader.e_lfanew - sizeof(IMAGE_DOS_HEADER);
-	printDosStub(file, dosStubSize);*/
-
 	IMAGE_FILE_HEADER fileHeader;
 	fread(&fileHeader, sizeof(IMAGE_FILE_HEADER), 1, file);
 
@@ -399,22 +687,26 @@ int main(int argc, char* argv[]) {
 	IMAGE_SECTION_HEADER* sectionHeaders = malloc(fileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER)); //dynamically memory allocation
 	fread(sectionHeaders, sizeof(IMAGE_SECTION_HEADER), fileHeader.NumberOfSections, file);
 
+	fseek(file, 0, SEEK_SET);  // Reset the file pointer to the beginning
+
 	int choice;
 	while (1) {
+		printf("-----------------------------------------------------------------\n");
 		printf("Please select an option.\n");
-		printf("	1. Print File Information\n");
-		printf("	2. Print DOS Header\n");
-		printf("	3. Print NT Header Signature\n");
-		printf("	4. Print File Header\n");
-		printf("	5. Print Optional Header\n");
-		printf("	6. Print Section Headers\n");
-		printf("	7. Print Import Table\n");
-		printf("	8. Hex Dump\n");
-		printf("	9. Strings\n");
-		printf("	0. Exit\n");
-
+		printf("	1.  Print File Information\n");
+		printf("	2.  Print DOS Header\n");
+		printf("	3.  Print NT Header Signature\n");
+		printf("	4.  Print File Header\n");
+		printf("	5.  Print Optional Header\n");
+		printf("	6.  Print Section Headers\n");
+		printf("	7.  Print Import Table\n");
+		printf("	8.  Hex Dump\n");
+		printf("	9.  Strings\n");
+		printf("	10. VirusTotal Hash Query\n");
+		printf("	0.  Exit\n");
 		printf("Enter your choice: ");
 		scanf_s("%d", &choice);
+		printf("-----------------------------------------------------------------\n");
 		printf("\n");
 
 		switch (choice) {
@@ -445,6 +737,9 @@ int main(int argc, char* argv[]) {
 		case 9:
 			printStrings(argv[1]);
 			break;
+		case 10:
+			queryVirusTotal(apiKey, fileHash);
+			break;
 		case 0:
 			printf("Exiting...\n");
 			free(sectionHeaders);
@@ -456,7 +751,3 @@ int main(int argc, char* argv[]) {
 		printf("\n");
 	}
 }
-
-
-
-
