@@ -21,7 +21,7 @@ This project uses the cJSON library for JSON parsing. The library was added from
 
 Installation:
 1. Clone the repository:
-   git clone https://github.com/your-username/pe-header-parser.git
+   git clone https://github.com/aycagl/PE-Header-Parser.git
 3. Add cJSON to your project:
   * Clone the cJSON repository from GitHub:
     git clone https://github.com/DaveGamble/cJSON.git
@@ -30,6 +30,6 @@ Installation:
 #Virustotal Integration
 * To use the VirusTotal functionality, you will need your own VirusTotal API key.
 * Replace the placeholder YOUR_API_KEY in the code with your actual API key:
-const char* api_key = "YOUR_API_KEY";
+const char* apiKey = "YOUR_API_KEY";
 
 Once built, you can run the tool by passing the path to the PE file you want to analyze.
