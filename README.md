@@ -25,10 +25,12 @@ PE-Header-Parser is a command-line tool designed for analyzing Portable Executab
 
 10- Query and print VirusTotal scan results for the file
 
-#Dependencies
+# Dependencies
+
 This project uses the cJSON library for JSON parsing. The library was added from another GitHub repository. You can add it to your project by following the steps below.
 
-Installation:
+# Installation:
+
 1. Clone the repository:
    git clone https://github.com/aycagl/PE-Header-Parser.git
 3. Add cJSON to your project:
@@ -36,7 +38,8 @@ Installation:
     git clone https://github.com/DaveGamble/cJSON.git
 3. Build the executable. Compile the source code using your preferred C compiler.
 
-#Virustotal Integration
+# Virustotal Integration 
+
 * To use the VirusTotal functionality, you will need your own VirusTotal API key.
 * Replace the placeholder YOUR_API_KEY in the code with your actual API key:
 const char* apiKey = "YOUR_API_KEY";
