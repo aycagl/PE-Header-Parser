@@ -241,9 +241,9 @@ void printSectionHeaders(IMAGE_SECTION_HEADER* sectionHeaders, int numberOfSecti
 	printf("---- IMAGE_SECTION_HEADERS ----\n");
 	for (int i = 0; i < numberOfSections; i++) {
 		printf("Section %d:\n", i + 1);
-		printf(" Name: %.8s\n", sectionHeaders[i].Name);
+		printf(" Name: %.8s\n", sectionHeaders[i].Name); // Name can be max 8 characters long 
 		printf(" Virtual size: 0x%x\n", sectionHeaders[i].Misc.VirtualSize);
-		printf(" Physical address: 0x%x\n", sectionHeaders[i].Misc.PhysicalAddress);
+		printf(" Physical address: 0x%x\n", sectionHeaders[i].Misc.PhysicalAddress); 
 		printf(" Virtual address: 0x%x\n", sectionHeaders[i].VirtualAddress);
 		printf(" Size of raw data: 0x%x\n", sectionHeaders[i].SizeOfRawData);
 		printf(" Pointer to raw data: 0x%x\n", sectionHeaders[i].PointerToRawData);
@@ -256,81 +256,110 @@ void printSectionHeaders(IMAGE_SECTION_HEADER* sectionHeaders, int numberOfSecti
 }
 
 void printImportTable(FILE* file, IMAGE_DATA_DIRECTORY* importDir, IMAGE_OPTIONAL_HEADER* optionalHeader, IMAGE_SECTION_HEADER* sectionHeaders, int numberOfSections) {
-	if (importDir->VirtualAddress == 0) {
-		printf("No import table found.\n");
+	// RVA to file offset translation for the Import Table
+	DWORD importTableOffset = RvaToOffset(importDir->VirtualAddress, sectionHeaders, numberOfSections);
+
+	// Check if the offset is valid
+	if (importTableOffset == 0) {
+		printf("Invalid Import Table RVA: 0x%X\n", importDir->VirtualAddress);
 		return;
 	}
-	// RVA to file offset translation
-	DWORD importTableOffset = RvaToOffset(importDir->VirtualAddress, sectionHeaders, numberOfSections);
-	fseek(file, importTableOffset, SEEK_SET);
 
+	fseek(file, importTableOffset, SEEK_SET);
 	printf("----IMPORT TABLE----\n");
+
 	IMAGE_IMPORT_DESCRIPTOR importDesc;
 
 	while (1) {
 		fread(&importDesc, sizeof(IMAGE_IMPORT_DESCRIPTOR), 1, file);
 		if (importDesc.Name == 0) {
-			break;
+			break;  // End of import descriptors
 		}
 
-		// get DLL name
+		// Get DLL name from import descriptor
 		DWORD nameRVA = importDesc.Name;
 		DWORD nameOffset = RvaToOffset(nameRVA, sectionHeaders, numberOfSections);
+
+		if (nameOffset == 0) {
+			printf("Invalid DLL name offset for import descriptor.\n");
+			printf("Import Descriptor Name RVA: 0x%X\n", importDesc.Name);
+			continue;
+		}
+
+		// Save current file position and seek to the DLL name offset
 		DWORD currentPos = ftell(file);
 		fseek(file, nameOffset, SEEK_SET);
 
 		char dllName[256] = { 0 };
-		fread(dllName, sizeof(char), 256, file);
+		fread(dllName, sizeof(char), 255, file);  // Read up to 255 bytes for the DLL name
+		dllName[255] = '\0';  // Null-terminate to avoid buffer overflow
+
 		printf("DLL Name: %s\n", dllName);
 
-		// get OriginalFirstThunk or FirstThunk value
+		// Restore the file position after reading DLL name
+		fseek(file, currentPos, SEEK_SET);
+
+		// Process the functions in the DLL (thunks)
 		DWORD thunkRVA = importDesc.OriginalFirstThunk ? importDesc.OriginalFirstThunk : importDesc.FirstThunk;
 		DWORD thunkOffset = RvaToOffset(thunkRVA, sectionHeaders, numberOfSections);
-		fseek(file, thunkOffset, SEEK_SET);
+		if (thunkOffset == 0) {
+			printf("Invalid thunk offset.\n");
+			continue;
+		}
 
+		fseek(file, thunkOffset, SEEK_SET);
 		IMAGE_THUNK_DATA thunkData;
 
 		while (1) {
 			fread(&thunkData, sizeof(IMAGE_THUNK_DATA), 1, file);
 			if (thunkData.u1.Function == 0) {
-				break;
+				break;  // No more functions
 			}
 
-			// if the highest bit is set, it's an ordinal; otherwise, it's a name.
+			// Check if it's an ordinal or a function name
 			if (thunkData.u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
 				printf("  Ordinal: %u\n", thunkData.u1.Ordinal & 0xFFFF);
 			}
 			else {
-				// fet functions names
+				// Fetch function names
 				DWORD functionNameRVA = thunkData.u1.AddressOfData;
-				DWORD functionNameOffset = RvaToOffset(functionNameRVA + 2, sectionHeaders, numberOfSections);
+				DWORD functionNameOffset = RvaToOffset(functionNameRVA, sectionHeaders, numberOfSections);
+
+				if (functionNameOffset == 0) {
+					printf("Invalid function name offset.\n");
+					continue;
+				}
+
+				// Skip the hint (first two bytes)
+				functionNameOffset += 2;
 				currentPos = ftell(file);
 				fseek(file, functionNameOffset, SEEK_SET);
 
 				char functionName[256] = { 0 };
-				fread(functionName, sizeof(char), 256, file);
-				printf("  Function: %s\n", functionName);
+				fread(functionName, sizeof(char), 255, file);  // Read up to 255 bytes
+				functionName[255] = '\0';  // Null-terminate
 
+				printf("  Function: %s\n", functionName);
 				fseek(file, currentPos, SEEK_SET);
 			}
 		}
-		// next IMAGE_IMPORT_DESCRIPTOR
+
+		// Move to the next IMAGE_IMPORT_DESCRIPTOR
 		importTableOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
 		fseek(file, importTableOffset, SEEK_SET);
 	}
 }
 
-//function to translate RVA to file offset
 DWORD RvaToOffset(DWORD rva, IMAGE_SECTION_HEADER* sectionHeaders, int numberOfSections) {
 	for (int i = 0; i < numberOfSections; i++) {
-		// RVA is comparing with SizeOfRawData 
-		if (rva >= sectionHeaders[i].VirtualAddress &&
-			rva < sectionHeaders[i].VirtualAddress + sectionHeaders[i].SizeOfRawData)
-		{
-			return rva - sectionHeaders[i].VirtualAddress + sectionHeaders[i].PointerToRawData;
+		DWORD sectionStart = sectionHeaders[i].VirtualAddress;
+		DWORD sectionSize = sectionHeaders[i].SizeOfRawData;
+		DWORD sectionEnd = sectionStart + sectionSize;
+
+		if (rva >= sectionStart && rva < sectionEnd) {
+			return rva - sectionStart + sectionHeaders[i].PointerToRawData;
 		}
 	}
-	printf("Error: RVA 0x%X does not match any section.\n", rva);
 	return 0;
 }
 
@@ -631,7 +660,7 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	const char* apiKey = "YOUR_API_KEY"; // Change this with your own api key
+	const char* apiKey = "cc0181eac3a5c2fc232a95deb529ebb78c74fe55e359fe41f0263e27892bfc1e";
 	const char* filePath = argv[1];
 
 	// Open the file to calculate the hash
@@ -726,6 +755,11 @@ int main(int argc, char* argv[]) {
 			printOptionalHeader(&optionalHeader);
 			break;
 		case 6:
+			// Seek to the correct position with fseek before reading IMAGE_SECTION_HEADERS
+			fseek(file, dosHeader.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + fileHeader.SizeOfOptionalHeader, SEEK_SET);
+
+			fread(sectionHeaders, sizeof(IMAGE_SECTION_HEADER), fileHeader.NumberOfSections, file);
+
 			printSectionHeaders(sectionHeaders, fileHeader.NumberOfSections);
 			break;
 		case 7:
