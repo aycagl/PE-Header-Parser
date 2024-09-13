@@ -660,7 +660,7 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	const char* apiKey = "cc0181eac3a5c2fc232a95deb529ebb78c74fe55e359fe41f0263e27892bfc1e";
+	const char* apiKey = "YOUR_API_KEY";
 	const char* filePath = argv[1];
 
 	// Open the file to calculate the hash
