@@ -1,6 +1,10 @@
 # PE-Header-Parser
 PE-Header-Parser is a command-line tool designed for analyzing Portable Executable (PE) files and displaying the results in a structured format.
 
+# Demo
+
+![Import Table Demo](./assets/demo.gif)
+
 # Features
 
 ![image](https://github.com/user-attachments/assets/1ff6dacb-2653-4259-aaaa-1fde926c187b)
